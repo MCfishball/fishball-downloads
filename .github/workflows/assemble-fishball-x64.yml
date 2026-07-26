@@ -1,0 +1,41 @@
+name: Assemble FishBall macOS Intel release
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  assemble:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Assemble and publish verified ZIP
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p parts
+          gh release download fishball-client-v1.0.6 \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern 'FishBall-Client-mac-x64.zip.part-*' \
+            --dir parts
+          test "$(find parts -type f | wc -l)" -eq 14
+          find parts -type f -name 'FishBall-Client-mac-x64.zip.part-*' -print0 \
+            | sort -z \
+            | xargs -0 cat > FishBall-Client-mac-x64.zip
+          echo "163b9dd0dfee0b385ff15dd61e1a592848cd86623525d3d7285979638e1b89ee  FishBall-Client-mac-x64.zip" \
+            | sha256sum --check
+          test "$(stat --format=%s FishBall-Client-mac-x64.zip)" -eq 110896605
+          gh release upload fishball-client-v1.0.6 \
+            FishBall-Client-mac-x64.zip \
+            --clobber \
+            --repo "$GITHUB_REPOSITORY"
+          gh release view fishball-client-v1.0.6 \
+            --repo "$GITHUB_REPOSITORY" \
+            --json assets \
+            --jq '.assets[] | select(.name | startswith("FishBall-Client-mac-x64.zip.part-")) | .id' \
+            | while read -r asset_id; do
+                gh api --method DELETE \
+                  "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id"
+              done

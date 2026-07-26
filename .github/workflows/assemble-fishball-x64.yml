@@ -20,7 +20,7 @@ jobs:
             --repo "$GITHUB_REPOSITORY" \
             --pattern 'FishBall-Client-mac-x64.zip.part-*' \
             --dir parts
-          test "$(find parts -type f | wc -l)" -eq 14
+          test "$(find parts -type f | wc -l)" -eq 53
           find parts -type f -name 'FishBall-Client-mac-x64.zip.part-*' -print0 \
             | sort -z \
             | xargs -0 cat > FishBall-Client-mac-x64.zip

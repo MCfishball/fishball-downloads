@@ -1,0 +1,73 @@
+name: Build FishBall Client Windows release
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Draft release tag that receives the Windows installers
+        required: true
+        default: fishball-client-v1.0.7
+      source_asset:
+        description: Temporary source archive attached to the draft release
+        required: true
+        default: FishBall-Client-1.0.7-build-source.tar.gz
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download build source
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          SOURCE_ASSET: ${{ inputs.source_asset }}
+        run: |
+          set -euo pipefail
+          gh release download "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern "$SOURCE_ASSET" \
+            --dir .
+          tar -xzf "$SOURCE_ASSET"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: fishball-client/launcher/package-lock.json
+
+      - name: Install dependencies
+        working-directory: fishball-client/launcher
+        run: npm ci
+
+      - name: Build launcher
+        working-directory: fishball-client/launcher
+        run: npm run build
+
+      - name: Package Windows x64 and x86
+        working-directory: fishball-client/launcher
+        run: npx electron-builder --config electron-builder.json --win nsis --x64 --ia32 --publish never
+
+      - name: Upload installers and update metadata
+        shell: bash
+        working-directory: fishball-client/launcher
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          gh release upload "$RELEASE_TAG" \
+            release/FishBall-Client-win-x64.exe \
+            release/FishBall-Client-win-x64.exe.blockmap \
+            release/FishBall-Client-win-ia32.exe \
+            release/FishBall-Client-win-ia32.exe.blockmap \
+            release/FishBall-Client-win.exe \
+            release/FishBall-Client-win.exe.blockmap \
+            release/latest.yml \
+            --clobber \
+            --repo "$GITHUB_REPOSITORY"

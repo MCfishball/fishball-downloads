@@ -1,0 +1,61 @@
+name: Transfer verified FishBall v1.0.34 release
+on:
+  workflow_dispatch:
+    inputs:
+      assets:
+        description: Expiring download URLs for the already verified v1.0.34 assets
+        required: true
+        type: string
+permissions:
+  contents: write
+jobs:
+  transfer:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Verify and transfer the fixed v1.0.34 artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 - <<'PYWORKER'
+          import concurrent.futures, hashlib, json, os, pathlib, subprocess, tempfile, urllib.parse, urllib.request
+          
+          repo = os.environ['GITHUB_REPOSITORY']
+          assert repo == 'MCfishball/fishball-downloads'
+          tag = 'fishball-client-v1.0.34'
+          event = json.loads(pathlib.Path(os.environ['GITHUB_EVENT_PATH']).read_text())
+          assets = json.loads(event['inputs']['assets'])
+          expected = {'FishBall-Client-mac-arm64.dmg': [114294330, 'd8e524f51fa85f4f01ac59af5b28238a536d409f3ba994edd0049226aa793150'], 'FishBall-Client-mac-arm64.dmg.blockmap': [119070, '7e73f9092e22298fc65fcdf9da393d6596f9c208abafdfa07910a71f7d4f6a32'], 'FishBall-Client-mac-arm64.zip': [109327729, 'dafb13ba19d16c31971449430a21175d1a20d9f4ad5992fc45bf3897b9b277c3'], 'FishBall-Client-mac-arm64.zip.blockmap': [114683, 'f55037fcd86c7de44756c663091b809b2dc373518226c5fcefea0fcea5968371'], 'FishBall-Client-mac-x64.dmg': [120160739, '49691723c04bc6b45ccae8ad7424c7a8202b4860131b2c70a0617bf850768cdc'], 'FishBall-Client-mac-x64.dmg.blockmap': [126567, 'ca31fb86a2a0710de13d19469acf23fb7930b7dbe144c45cd07fe6574e68e1c2'], 'FishBall-Client-mac-x64.zip': [115180069, '6aa88d244c6e83202ba5f1caa7b90015dbc0bad9ee7de2108f588d5dec2f931f'], 'FishBall-Client-mac-x64.zip.blockmap': [119262, '7ba02cb899d15a8b75a305e195b7aa9594ed48398b0b9a9ea1044fb2c450d194'], 'FishBall-Client-win-ia32.exe': [95361554, 'd493249a177b6451732079930d5ed9b3964b0b999a9b404b4a596207019b09a4'], 'FishBall-Client-win-ia32.exe.blockmap': [99031, 'b0725f9cef54ab195bc553f1a6a444a92182ada5d7e879fe9c5e30ae9e53ed96'], 'FishBall-Client-win-x64.exe': [100171774, '7550ad872e83192c0105017e19e8ae7c794c63629e220177c0abe36ae0921e8b'], 'FishBall-Client-win-x64.exe.blockmap': [104215, '66196758a3644c6dc5ae68615c29829141c584b6367b063e41019cef1b9e3e2e'], 'latest-mac.yml': [832, 'b3da28a70843d6cc2f09b2dae52883bb49d6412acd4690ba08caad1a9f10bcdc'], 'latest.yml': [519, '0886a06264401419005158d09eda18d3e51f194f24d5de15bbb0356219368c3e']}
+          assert {a['name'] for a in assets} == set(expected)
+          release = json.loads(subprocess.check_output(['gh','release','view',tag,'--repo',repo,'--json','isDraft,assets'],text=True))
+          assert release['isDraft'], 'Only the existing draft may be updated'
+          present = {a['name']: a for a in release['assets']}
+          root = pathlib.Path(tempfile.mkdtemp(prefix='verified-fishball-release-'))
+          
+          def transfer(a):
+              name = a['name']
+              assert pathlib.Path(name).name == name
+              size, digest = expected[name]
+              assert a['size'] == size and a['sha256'] == digest
+              if name in present and present[name]['state'] == 'uploaded':
+                  assert present[name]['size'] == size and present[name]['digest'] == 'sha256:'+digest
+                  print('Already verified:', name, flush=True)
+                  return
+              url = urllib.parse.urlsplit(a['url'])
+              assert url.scheme == 'https' and url.hostname == 'release-assets.githubusercontent.com'
+              path = root/name
+              h = hashlib.sha256()
+              with urllib.request.urlopen(a['url'], timeout=120) as response, path.open('wb') as f:
+                  assert response.status == 200
+                  while True:
+                      b = response.read(4*1024*1024)
+                      if not b: break
+                      h.update(b); f.write(b)
+              assert path.stat().st_size == size and h.hexdigest() == digest, name
+              subprocess.run(['gh','release','upload',tag,str(path),'--repo',repo,'--clobber'],check=True,timeout=600)
+              print('Transferred verified asset:', name, flush=True)
+          
+          with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
+              list(pool.map(transfer, assets))
+          print('All v1.0.34 installer files transferred. Release remains a draft.')
+          PYWORKER

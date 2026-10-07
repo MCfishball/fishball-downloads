@@ -125,6 +125,47 @@ jobs:
         working-directory: fishball-client/launcher
         run: npx electron-builder --config electron-builder.json --win nsis --ia32 --publish never
 
+      - name: Record packaged Windows icon proof
+        shell: bash
+        working-directory: fishball-client/launcher
+        run: |
+          node <<'NODE'
+          const fs = require('node:fs');
+          const path = require('node:path');
+          const crypto = require('node:crypto');
+          const PE = require('pe-library');
+          const ResEdit = require('resedit');
+          const hash = data => crypto.createHash('sha256').update(Buffer.from(data)).digest('hex');
+          const frames = items => items.map(item => ({
+            raw: item.isRaw(), width: item.width, height: item.height, bitCount: item.bitCount,
+            bytes: item.isRaw() ? item.bin.byteLength : item.generate().byteLength,
+            sha256: hash(item.isRaw() ? item.bin : item.generate())
+          }));
+          const expected = frames(ResEdit.Data.IconFile.from(fs.readFileSync('build/icon-win.ico')).icons.map(item => item.data));
+          const files = [
+            'release/win-unpacked/FishBall Client.exe',
+            'release/win-ia32-unpacked/FishBall Client.exe',
+            'release/FishBall-Client-win-x64.exe',
+            'release/FishBall-Client-win-ia32.exe'
+          ];
+          const proof = { version: require('./package.json').version, expected, files: files.map(file => {
+            const bytes = fs.readFileSync(file);
+            const executable = PE.NtExecutable.from(bytes, {ignoreCert: true});
+            const resources = PE.NtExecutableResource.from(executable);
+            return { file, bytes: bytes.length, sha256: hash(bytes),
+              groups: ResEdit.Resource.IconGroupEntry.fromEntries(resources.entries).map(group => ({
+                id: group.id, lang: group.lang, directoryFrames: group.icons,
+                resourceFrames: resources.entries.filter(entry => entry.type === 3 && entry.lang === group.lang && group.icons.some(icon => icon.iconID === entry.id)).map(entry => ({
+                  id: entry.id, lang: entry.lang, bytes: entry.bin.byteLength, sha256: hash(entry.bin)
+                })),
+                decodedFrames: frames(group.getIconItemsFromEntries(resources.entries))
+              }))
+            };
+          })};
+          fs.writeFileSync(path.join('release', 'windows-icon-proof.json'), JSON.stringify(proof, null, 2) + '\n');
+          console.log(JSON.stringify(proof, null, 2));
+          NODE
+
       - name: Verify both Windows apps and installers
         shell: bash
         working-directory: fishball-client/launcher
@@ -182,3 +223,15 @@ jobs:
             release/latest.yml \
             --clobber \
             --repo "$GITHUB_REPOSITORY"
+
+      - name: Retain installer and icon evidence
+        if: ${{ always() && hashFiles('fishball-client/launcher/release/FishBall-Client-win-*.exe') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-94-installer-icon-proof
+          retention-days: 1
+          if-no-files-found: error
+          path: |
+            fishball-client/launcher/release/FishBall-Client-win-x64.exe
+            fishball-client/launcher/release/FishBall-Client-win-ia32.exe
+            fishball-client/launcher/release/windows-icon-proof.json

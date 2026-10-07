@@ -55,7 +55,9 @@ jobs:
           test "$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft | tr -d '\r')" = true
           echo 'Preparing the decryption tools and temporary directory.'
           command -v openssl >/dev/null
-          INPUT_DIR="$(mktemp -d "$RUNNER_TEMP/fbc94-input.XXXXXX")"
+          INPUT_ROOT="$(cygpath -u "$RUNNER_TEMP")"
+          WORKSPACE_ROOT="$(cygpath -u "$GITHUB_WORKSPACE")"
+          INPUT_DIR="$(mktemp -d "$INPUT_ROOT/fbc94-input.XXXXXX")"
           trap 'rm -f "$INPUT_DIR/$SOURCE_ASSET" "$INPUT_DIR/source.tar.gz"; rmdir "$INPUT_DIR"' EXIT
           echo 'Downloading encrypted build input.'
           gh release download "$RELEASE_TAG" \
@@ -71,7 +73,7 @@ jobs:
             -out "$INPUT_DIR/source.tar.gz" \
             -pass env:FISHBALL_BUILD_94_KEY
           echo 'Checking the decrypted archive paths.'
-          tar -tzf "$INPUT_DIR/source.tar.gz" | while IFS= read -r entry; do
+          tar --force-local -tzf "$INPUT_DIR/source.tar.gz" | while IFS= read -r entry; do
             case "$entry" in
               fishball-client|fishball-client/*) ;;
               *) echo 'Unexpected path in build input' >&2; exit 1 ;;
@@ -81,7 +83,7 @@ jobs:
             esac
           done
           echo 'Extracting the verified build input.'
-          tar -xzf "$INPUT_DIR/source.tar.gz" -C "$GITHUB_WORKSPACE"
+          tar --force-local -xzf "$INPUT_DIR/source.tar.gz" -C "$WORKSPACE_ROOT"
           echo 'Build input is ready.'
 
       - uses: actions/setup-node@v4

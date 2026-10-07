@@ -63,7 +63,7 @@ jobs:
             --pattern "$SOURCE_ASSET" \
             --dir "$INPUT_DIR"
           echo 'Verifying the encrypted build input checksum.'
-          ACTUAL_SHA256="$(sha256sum "$INPUT_DIR/$SOURCE_ASSET" | cut -d ' ' -f 1 | tr -d '\r')"
+          ACTUAL_SHA256="$(sha256sum < "$INPUT_DIR/$SOURCE_ASSET" | cut -d ' ' -f 1 | tr -d '\r')"
           test "${ACTUAL_SHA256,,}" = "${SOURCE_SHA256,,}"
           echo 'Decrypting the verified build input.'
           openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 \

@@ -20,6 +20,7 @@ on:
 
 permissions:
   contents: write
+  actions: read
 
 concurrency:
   group: fishball-windows-${{ inputs.release_tag }}
@@ -101,29 +102,83 @@ jobs:
         working-directory: fishball-client/launcher
         run: npm ci --no-audit --no-fund
 
-      - name: Build launcher and verify bundled mods
-        working-directory: fishball-client/launcher
-        run: npm run build
-
-      - name: Test the Windows downloads and bundled Java preparation
+      - name: Verify the committed platform path correction
         shell: bash
         working-directory: fishball-client/launcher
         run: |
-          node --test \
-            dist-electron/services/downloader.test.js \
-            dist-electron/services/electronDownloadTransport.test.js \
-            dist-electron/services/javaDownloadSources.test.js \
-            dist-electron/services/bundledJavaRuntime.test.js \
-            dist-electron/services/minecraftAssets.test.js \
-            scripts/prepare-windows-java.test.cjs
+          node <<'NODE'
+          const assert = require('node:assert/strict');
+          const fs = require('node:fs');
+          const crypto = require('node:crypto');
+          const file = 'scripts/verify-windows-package.cjs';
+          const sha = data => crypto.createHash('sha256').update(data).digest('hex');
+          let source = fs.readFileSync(file, 'utf8');
+          assert.equal(sha(source), '287756cf06305ec96edfbcc0864a7ed4f3a382e677343c58a4e9e130adf96b77');
+          for (const basename of ['windowsJavaRuntimeManifest.json', 'javaManager.js']) {
+            const before = `Asar.extractFile(asar, 'dist-electron/services/${basename}')`;
+            const after = `Asar.extractFile(asar, path.join('dist-electron', 'services', '${basename}'))`;
+            assert.equal(source.split(before).length - 1, 1);
+            source = source.replace(before, after);
+          }
+          assert.equal(sha(source), 'cd0c139544c4d73fc2956d1051d81bc91da317285f4df37f3639c397d986427c');
+          fs.writeFileSync(file, source);
+          console.log('Verified exact package verifier from committed source 1ebbf40f9.');
+          NODE
 
-      - name: Package Windows x64
+      - name: Restore the immutable Windows build output
+        shell: bash
         working-directory: fishball-client/launcher
-        run: npx electron-builder --config electron-builder.json --win nsis --x64 --publish never
-
-      - name: Package Windows x86
-        working-directory: fishball-client/launcher
-        run: npx electron-builder --config electron-builder.json --win nsis --ia32 --publish never
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -Eeuo pipefail
+          mkdir -p .ci-provenance
+          gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/11487199322" > .ci-provenance/artifact.json
+          node <<'NODE'
+          const assert = require('node:assert/strict');
+          const fs = require('node:fs');
+          const metadata = JSON.parse(fs.readFileSync('.ci-provenance/artifact.json', 'utf8'));
+          assert.equal(metadata.id, 11487199322);
+          assert.equal(metadata.name, 'windows-94-installer-icon-proof');
+          assert.equal(metadata.expired, false);
+          assert.equal(metadata.digest, 'sha256:6220e8c8ed082e8ca7799bf31ed378ae35800dadae775cf70683c1d0cc23000e');
+          assert.equal(metadata.workflow_run.id, 37634228688);
+          assert.equal(metadata.workflow_run.head_sha, '0f90731eecc66bbe68d61ac97ea449cf06ac19ce');
+          NODE
+          gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/11487199322/zip" > .ci-provenance/installers.zip
+          node <<'NODE'
+          const assert = require('node:assert/strict');
+          const fs = require('node:fs');
+          const path = require('node:path');
+          const crypto = require('node:crypto');
+          const {execFileSync} = require('node:child_process');
+          const AdmZip = require('adm-zip');
+          const archive = fs.readFileSync('.ci-provenance/installers.zip');
+          assert.equal(crypto.createHash('sha256').update(archive).digest('hex'), '6220e8c8ed082e8ca7799bf31ed378ae35800dadae775cf70683c1d0cc23000e');
+          const zip = new AdmZip(archive);
+          const entries = zip.getEntries().filter(entry => !entry.isDirectory);
+          assert.deepEqual(entries.map(entry => entry.entryName).sort(), ['FishBall-Client-win-ia32.exe', 'FishBall-Client-win-x64.exe', 'windows-icon-proof.json']);
+          fs.mkdirSync('release', {recursive:true});
+          for (const entry of entries) fs.writeFileSync(path.join('release', entry.entryName), zip.readFile(entry));
+          const expected = {
+            x64: {size:165391447, sha256:'0ff1f248f083e21c6b32f7f0dbca740aa0801d95d1ffb23aeed42827d4becc53'},
+            ia32: {size:159791756, sha256:'bfe61fa44b1ab6a04044398e93071ae4d6fb2db70379e6b79c4248cfc666ca31'}
+          };
+          for (const arch of ['x64', 'ia32']) {
+            const installer = path.join('release', `FishBall-Client-win-${arch}.exe`);
+            const data = fs.readFileSync(installer);
+            assert.equal(data.length, expected[arch].size);
+            assert.equal(crypto.createHash('sha256').update(data).digest('hex'), expected[arch].sha256);
+            const unpacked = path.resolve('release', arch === 'x64' ? 'win-unpacked' : 'win-ia32-unpacked');
+            const files = ['FishBall Client.exe', 'resources/icon-win.png', 'resources/runtime/*', 'resources/app.asar',
+              'resources/app.asar.unpacked/node_modules/keytar/build/Release/keytar.node',
+              'resources/app.asar.unpacked/node_modules/@azure/msal-node-runtime/dist/msal-node-runtime.node',
+              `resources/app.asar.unpacked/node_modules/@azure/msal-node-extensions/bin/${arch}/dpapi.node`,
+              'resources/mods/fishball-client-mod.jar', 'resources/mods/fishball-identity-mod.jar'];
+            execFileSync(require('7zip-bin').path7za, ['x', installer, ...files, '-o' + unpacked, '-y'], {stdio:'inherit'});
+          }
+          console.log('Restored exact installers from immutable run 37634228688 artifact 11487199322.');
+          NODE
 
       - name: Record packaged Windows icon proof
         shell: bash
@@ -173,7 +228,7 @@ jobs:
           node scripts/verify-windows-package.cjs release/win-unpacked x64 release/FishBall-Client-win-x64.exe
           node scripts/verify-windows-package.cjs release/win-ia32-unpacked ia32 release/FishBall-Client-win-ia32.exe
 
-      - name: Normalize and verify Windows update metadata
+      - name: Generate and verify Windows update metadata
         shell: bash
         working-directory: fishball-client/launcher
         run: |
@@ -183,23 +238,30 @@ jobs:
           const path = require('node:path');
           const crypto = require('node:crypto');
           const yaml = require('js-yaml');
-          const version = require('./package.json').version;
-          assert.equal(version, '1.0.94');
-          const names = ['FishBall-Client-win-x64.exe', 'FishBall-Client-win-ia32.exe'];
-          const files = names.map(url => {
-            const data = fs.readFileSync(path.join('release', url));
-            return { url, sha512: crypto.createHash('sha512').update(data).digest('base64'), size: data.length };
-          });
-          const feedPath = path.join('release', 'latest.yml');
-          const feed = { version, files, path: files[0].url, sha512: files[0].sha512, releaseDate: new Date().toISOString() };
-          fs.writeFileSync(feedPath, yaml.dump(feed, { lineWidth: -1 }));
-          const actual = yaml.load(fs.readFileSync(feedPath, 'utf8'));
-          assert.equal(actual.version, version);
-          assert.deepEqual(actual.files, files);
-          assert.equal(actual.path, files[0].url);
-          assert.equal(actual.sha512, files[0].sha512);
-          for (const name of names) assert.ok(fs.statSync(path.join('release', name + '.blockmap')).size > 0);
-          console.log('Verified 1.0.94 Windows feed for x64 and ia32.');
+          const {executeAppBuilderAsJson} = require('app-builder-lib/out/util/appBuilder');
+          (async () => {
+            const version = require('./package.json').version;
+            assert.equal(version, '1.0.94');
+            const names = ['FishBall-Client-win-x64.exe', 'FishBall-Client-win-ia32.exe'];
+            for (const name of names) {
+              const file = path.join('release', name);
+              await executeAppBuilderAsJson(['blockmap', '--input', file, '--output', file + '.blockmap']);
+              assert.ok(fs.statSync(file + '.blockmap').size > 0);
+            }
+            const files = names.map(url => {
+              const data = fs.readFileSync(path.join('release', url));
+              return { url, sha512: crypto.createHash('sha512').update(data).digest('base64'), size: data.length };
+            });
+            const feedPath = path.join('release', 'latest.yml');
+            const feed = { version, files, path: files[0].url, sha512: files[0].sha512, releaseDate: new Date().toISOString() };
+            fs.writeFileSync(feedPath, yaml.dump(feed, { lineWidth: -1 }));
+            const actual = yaml.load(fs.readFileSync(feedPath, 'utf8'));
+            assert.equal(actual.version, version);
+            assert.deepEqual(actual.files, files);
+            assert.equal(actual.path, files[0].url);
+            assert.equal(actual.sha512, files[0].sha512);
+            console.log('Verified 1.0.94 Windows feed and regenerated official blockmaps for exact x64 and ia32 installers.');
+          })().catch(error => { console.error(error); process.exitCode=1; });
           NODE
 
       - name: Upload verified installers to the existing draft

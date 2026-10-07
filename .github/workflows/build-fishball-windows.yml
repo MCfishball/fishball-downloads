@@ -44,25 +44,33 @@ jobs:
           SOURCE_SHA256: ${{ inputs.source_sha256 }}
           FISHBALL_BUILD_94_KEY: ${{ secrets.FISHBALL_BUILD_94_KEY }}
         run: |
-          set -euo pipefail
+          set -Eeuo pipefail
+          trap 'printf "Build input failed at line %s\n" "$LINENO" >&2' ERR
+          echo 'Validating encrypted build input.'
           test "$RELEASE_TAG" = fishball-client-v1.0.94
           [[ "$SOURCE_ASSET" =~ ^[A-Za-z0-9._-]+\.enc$ ]]
           [[ "$SOURCE_SHA256" =~ ^[A-Fa-f0-9]{64}$ ]]
           test -n "$FISHBALL_BUILD_94_KEY"
-          test "$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)" = true
+          echo 'Checking the release is still a draft.'
+          test "$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft | tr -d '\r')" = true
+          echo 'Preparing the decryption tools and temporary directory.'
           command -v openssl >/dev/null
           INPUT_DIR="$(mktemp -d "$RUNNER_TEMP/fbc94-input.XXXXXX")"
           trap 'rm -f "$INPUT_DIR/$SOURCE_ASSET" "$INPUT_DIR/source.tar.gz"; rmdir "$INPUT_DIR"' EXIT
+          echo 'Downloading encrypted build input.'
           gh release download "$RELEASE_TAG" \
             --repo "$GITHUB_REPOSITORY" \
             --pattern "$SOURCE_ASSET" \
             --dir "$INPUT_DIR"
-          ACTUAL_SHA256="$(sha256sum "$INPUT_DIR/$SOURCE_ASSET" | cut -d ' ' -f 1)"
+          echo 'Verifying the encrypted build input checksum.'
+          ACTUAL_SHA256="$(sha256sum "$INPUT_DIR/$SOURCE_ASSET" | cut -d ' ' -f 1 | tr -d '\r')"
           test "${ACTUAL_SHA256,,}" = "${SOURCE_SHA256,,}"
+          echo 'Decrypting the verified build input.'
           openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 \
             -in "$INPUT_DIR/$SOURCE_ASSET" \
             -out "$INPUT_DIR/source.tar.gz" \
             -pass env:FISHBALL_BUILD_94_KEY
+          echo 'Checking the decrypted archive paths.'
           tar -tzf "$INPUT_DIR/source.tar.gz" | while IFS= read -r entry; do
             case "$entry" in
               fishball-client|fishball-client/*) ;;
@@ -72,7 +80,9 @@ jobs:
               */../*|*/./*) echo 'Invalid path in build input' >&2; exit 1 ;;
             esac
           done
+          echo 'Extracting the verified build input.'
           tar -xzf "$INPUT_DIR/source.tar.gz" -C "$GITHUB_WORKSPACE"
+          echo 'Build input is ready.'
 
       - uses: actions/setup-node@v4
         with:
@@ -156,9 +166,12 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ inputs.release_tag }}
         run: |
-          set -euo pipefail
+          set -Eeuo pipefail
+          trap 'printf "Draft upload failed at line %s\n" "$LINENO" >&2' ERR
+          echo 'Checking the verified release upload target.'
           test "$RELEASE_TAG" = fishball-client-v1.0.94
-          test "$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)" = true
+          test "$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft | tr -d '\r')" = true
+          echo 'Uploading the five verified Windows release files to the draft.'
           gh release upload "$RELEASE_TAG" \
             release/FishBall-Client-win-x64.exe \
             release/FishBall-Client-win-x64.exe.blockmap \

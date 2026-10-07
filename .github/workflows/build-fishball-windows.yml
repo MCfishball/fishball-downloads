@@ -4,36 +4,75 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: Draft release tag that receives the Windows installers
+        description: Existing draft release tag (FishBall Client 1.0.94 only)
+        type: string
         required: true
-        default: fishball-client-v1.0.7
+        default: fishball-client-v1.0.94
       source_asset:
-        description: Temporary source archive attached to the draft release
+        description: Encrypted build source asset on the draft release
+        type: string
         required: true
-        default: FishBall-Client-1.0.7-build-source.tar.gz
+        default: FishBall-Client-1.0.94-build-source.tar.gz.enc
+      source_sha256:
+        description: SHA256 of the encrypted build source asset
+        type: string
+        required: true
 
 permissions:
   contents: write
 
+concurrency:
+  group: fishball-windows-${{ inputs.release_tag }}
+  cancel-in-progress: false
+
+env:
+  USE_HARD_LINKS: "false"
+
 jobs:
   build-windows:
     runs-on: windows-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download build source
+      - name: Verify and decrypt the build input
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ inputs.release_tag }}
           SOURCE_ASSET: ${{ inputs.source_asset }}
+          SOURCE_SHA256: ${{ inputs.source_sha256 }}
+          FISHBALL_BUILD_94_KEY: ${{ secrets.FISHBALL_BUILD_94_KEY }}
         run: |
           set -euo pipefail
+          test "$RELEASE_TAG" = fishball-client-v1.0.94
+          [[ "$SOURCE_ASSET" =~ ^[A-Za-z0-9._-]+\.enc$ ]]
+          [[ "$SOURCE_SHA256" =~ ^[A-Fa-f0-9]{64}$ ]]
+          test -n "$FISHBALL_BUILD_94_KEY"
+          test "$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)" = true
+          command -v openssl >/dev/null
+          INPUT_DIR="$(mktemp -d "$RUNNER_TEMP/fbc94-input.XXXXXX")"
+          trap 'rm -f "$INPUT_DIR/$SOURCE_ASSET" "$INPUT_DIR/source.tar.gz"; rmdir "$INPUT_DIR"' EXIT
           gh release download "$RELEASE_TAG" \
             --repo "$GITHUB_REPOSITORY" \
             --pattern "$SOURCE_ASSET" \
-            --dir .
-          tar -xzf "$SOURCE_ASSET"
+            --dir "$INPUT_DIR"
+          ACTUAL_SHA256="$(sha256sum "$INPUT_DIR/$SOURCE_ASSET" | cut -d ' ' -f 1)"
+          test "${ACTUAL_SHA256,,}" = "${SOURCE_SHA256,,}"
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 \
+            -in "$INPUT_DIR/$SOURCE_ASSET" \
+            -out "$INPUT_DIR/source.tar.gz" \
+            -pass env:FISHBALL_BUILD_94_KEY
+          tar -tzf "$INPUT_DIR/source.tar.gz" | while IFS= read -r entry; do
+            case "$entry" in
+              fishball-client|fishball-client/*) ;;
+              *) echo 'Unexpected path in build input' >&2; exit 1 ;;
+            esac
+            case "/$entry/" in
+              */../*|*/./*) echo 'Invalid path in build input' >&2; exit 1 ;;
+            esac
+          done
+          tar -xzf "$INPUT_DIR/source.tar.gz" -C "$GITHUB_WORKSPACE"
 
       - uses: actions/setup-node@v4
         with:
@@ -41,19 +80,76 @@ jobs:
           cache: npm
           cache-dependency-path: fishball-client/launcher/package-lock.json
 
+      - name: Verify the release version
+        shell: bash
+        working-directory: fishball-client/launcher
+        run: node -e "require('node:assert/strict').equal(require('./package.json').version, '1.0.94')"
+
       - name: Install dependencies
         working-directory: fishball-client/launcher
-        run: npm ci
+        run: npm ci --no-audit --no-fund
 
-      - name: Build launcher
+      - name: Build launcher and verify bundled mods
         working-directory: fishball-client/launcher
         run: npm run build
 
-      - name: Package Windows x64 and x86
+      - name: Test the Windows downloads and bundled Java preparation
+        shell: bash
         working-directory: fishball-client/launcher
-        run: npx electron-builder --config electron-builder.json --win nsis --x64 --ia32 --publish never
+        run: |
+          node --test \
+            dist-electron/services/downloader.test.js \
+            dist-electron/services/electronDownloadTransport.test.js \
+            dist-electron/services/javaDownloadSources.test.js \
+            dist-electron/services/bundledJavaRuntime.test.js \
+            dist-electron/services/minecraftAssets.test.js \
+            scripts/prepare-windows-java.test.cjs
 
-      - name: Upload installers and update metadata
+      - name: Package Windows x64
+        working-directory: fishball-client/launcher
+        run: npx electron-builder --config electron-builder.json --win nsis --x64 --publish never
+
+      - name: Package Windows x86
+        working-directory: fishball-client/launcher
+        run: npx electron-builder --config electron-builder.json --win nsis --ia32 --publish never
+
+      - name: Verify both Windows apps and installers
+        shell: bash
+        working-directory: fishball-client/launcher
+        run: |
+          node scripts/verify-windows-package.cjs release/win-unpacked x64 release/FishBall-Client-win-x64.exe
+          node scripts/verify-windows-package.cjs release/win-ia32-unpacked ia32 release/FishBall-Client-win-ia32.exe
+
+      - name: Normalize and verify Windows update metadata
+        shell: bash
+        working-directory: fishball-client/launcher
+        run: |
+          node <<'NODE'
+          const assert = require('node:assert/strict');
+          const fs = require('node:fs');
+          const path = require('node:path');
+          const crypto = require('node:crypto');
+          const yaml = require('js-yaml');
+          const version = require('./package.json').version;
+          assert.equal(version, '1.0.94');
+          const names = ['FishBall-Client-win-x64.exe', 'FishBall-Client-win-ia32.exe'];
+          const files = names.map(url => {
+            const data = fs.readFileSync(path.join('release', url));
+            return { url, sha512: crypto.createHash('sha512').update(data).digest('base64'), size: data.length };
+          });
+          const feedPath = path.join('release', 'latest.yml');
+          const feed = { version, files, path: files[0].url, sha512: files[0].sha512, releaseDate: new Date().toISOString() };
+          fs.writeFileSync(feedPath, yaml.dump(feed, { lineWidth: -1 }));
+          const actual = yaml.load(fs.readFileSync(feedPath, 'utf8'));
+          assert.equal(actual.version, version);
+          assert.deepEqual(actual.files, files);
+          assert.equal(actual.path, files[0].url);
+          assert.equal(actual.sha512, files[0].sha512);
+          for (const name of names) assert.ok(fs.statSync(path.join('release', name + '.blockmap')).size > 0);
+          console.log('Verified 1.0.94 Windows feed for x64 and ia32.');
+          NODE
+
+      - name: Upload verified installers to the existing draft
         shell: bash
         working-directory: fishball-client/launcher
         env:
@@ -61,13 +157,13 @@ jobs:
           RELEASE_TAG: ${{ inputs.release_tag }}
         run: |
           set -euo pipefail
+          test "$RELEASE_TAG" = fishball-client-v1.0.94
+          test "$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)" = true
           gh release upload "$RELEASE_TAG" \
             release/FishBall-Client-win-x64.exe \
             release/FishBall-Client-win-x64.exe.blockmap \
             release/FishBall-Client-win-ia32.exe \
             release/FishBall-Client-win-ia32.exe.blockmap \
-            release/FishBall-Client-win.exe \
-            release/FishBall-Client-win.exe.blockmap \
             release/latest.yml \
             --clobber \
             --repo "$GITHUB_REPOSITORY"

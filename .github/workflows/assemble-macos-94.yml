@@ -45,7 +45,9 @@ jobs:
       - name: Download the verified ZIP from the existing draft
         run: |
           set -euo pipefail
-          test "$(gh api "repos/$GH_REPO/releases/tags/$RELEASE_TAG" --jq .draft)" = true
+          RELEASE_ID="$(gh api "repos/$GH_REPO/releases?per_page=100" --jq '.[] | select(.tag_name == "fishball-client-v1.0.94") | .id')"
+          test -n "$RELEASE_ID"
+          test "$(gh api "repos/$GH_REPO/releases/$RELEASE_ID" --jq .draft)" = true
           mkdir input
           gh release download "$RELEASE_TAG" --repo "$GH_REPO" \
             --pattern "FishBall-Client-mac-$TARGET_ARCH.zip" --dir input
@@ -133,7 +135,9 @@ jobs:
       - name: Upload DMGs to the existing draft without publishing
         run: |
           set -euo pipefail
-          test "$(gh api "repos/$GH_REPO/releases/tags/$RELEASE_TAG" --jq .draft)" = true
+          RELEASE_ID="$(gh api "repos/$GH_REPO/releases?per_page=100" --jq '.[] | select(.tag_name == "fishball-client-v1.0.94") | .id')"
+          test -n "$RELEASE_ID"
+          test "$(gh api "repos/$GH_REPO/releases/$RELEASE_ID" --jq .draft)" = true
           gh release upload "$RELEASE_TAG" --repo "$GH_REPO" --clobber \
             "out/FishBall-Client-mac-$TARGET_ARCH.dmg" \
             "out/FishBall-Client-mac-$TARGET_ARCH.dmg.blockmap"

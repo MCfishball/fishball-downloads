@@ -1,0 +1,139 @@
+name: Assemble verified FishBall macOS 1.0.94 DMGs
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: assemble-macos-94-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  assemble:
+    if: github.repository == 'MCfishball/fishball-downloads'
+    runs-on: macos-14
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            zip_sha256: 4dd36e631d18e93ef68c607abafe763cf1b7cacd7d3f842dc5fe1f26e44d8a11
+            zip_size: 142003767
+          - arch: arm64
+            zip_sha256: 5b12196c32fd44b0fa55fa83f03e8f3437c84746f7c9616aa2f985486ae6dad3
+            zip_size: 177030745
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: MCfishball/fishball-downloads
+      RELEASE_TAG: fishball-client-v1.0.94
+      TARGET_ARCH: ${{ matrix.arch }}
+      ZIP_SHA256: ${{ matrix.zip_sha256 }}
+      ZIP_SIZE: ${{ matrix.zip_size }}
+      CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+      USE_HARD_LINKS: 'false'
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Download the verified ZIP from the existing draft
+        run: |
+          set -euo pipefail
+          test "$(gh api "repos/$GH_REPO/releases/tags/$RELEASE_TAG" --jq .draft)" = true
+          mkdir input
+          gh release download "$RELEASE_TAG" --repo "$GH_REPO" \
+            --pattern "FishBall-Client-mac-$TARGET_ARCH.zip" --dir input
+          ZIP_PATH="input/FishBall-Client-mac-$TARGET_ARCH.zip"
+          test "$(stat -f %z "$ZIP_PATH")" = "$ZIP_SIZE"
+          printf '%s  %s\n' "$ZIP_SHA256" "$ZIP_PATH" | shasum -a 256 -c -
+          unzip -tq "$ZIP_PATH"
+          mkdir verified-app
+          ditto -x -k "$ZIP_PATH" verified-app
+
+      - name: Verify the signed 1.0.94 application
+        run: |
+          set -euo pipefail
+          APP_PATH='verified-app/FishBall Client.app'
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP_PATH/Contents/Info.plist")" = top.mcfishball.client
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP_PATH/Contents/Info.plist")" = 1.0.94
+          codesign --verify --deep --strict "$APP_PATH"
+          codesign --verify -R='identifier "top.mcfishball.client"' "$APP_PATH"
+          codesign -d -r- "$APP_PATH" 2>&1 | grep -F 'designated => identifier "top.mcfishball.client"'
+          file "$APP_PATH/Contents/MacOS/FishBall Client" | grep -F "$(test "$TARGET_ARCH" = x64 && printf x86_64 || printf arm64)"
+          printf '%s  %s\n' 7d69a07289f1010c35a065295977085ddb2a66614a7bd0280c2506c9b6172a95 "$APP_PATH/Contents/Resources/mods/fishball-client-mod.jar" | shasum -a 256 -c -
+          printf '%s  %s\n' aaa95d0e98881caa799c8ae1de41f10f458200dcd7a50dcc8c302ba71bcee908 "$APP_PATH/Contents/Resources/mods/fishball-identity-mod.jar" | shasum -a 256 -c -
+
+      - name: Install the fixed DMG packaging tool
+        run: |
+          set -euo pipefail
+          cat > package.json <<'JSON'
+          {"name":"fishball-verified-dmg-assembler","version":"1.0.94","private":true,"description":"Wrap an already verified FishBall application in a DMG","author":"FishBall","devDependencies":{"electron-builder":"25.1.8"}}
+          JSON
+          cat > electron-builder.dmg.json <<'JSON'
+          {"appId":"top.mcfishball.client","productName":"FishBall Client","artifactName":"FishBall-Client-mac-${arch}.${ext}","electronVersion":"32.3.3","npmRebuild":false,"directories":{"output":"out"},"mac":{"identity":null,"hardenedRuntime":false},"publish":null}
+          JSON
+          npm install --ignore-scripts --no-audit --no-fund
+
+      - name: Wrap the existing application in a DMG
+        run: |
+          set -euo pipefail
+          npx --no-install electron-builder --config electron-builder.dmg.json \
+            --prepackaged 'verified-app/FishBall Client.app' \
+            --mac dmg "--$TARGET_ARCH" --publish never
+          printf '%s  %s\n' "$ZIP_SHA256" "input/FishBall-Client-mac-$TARGET_ARCH.zip" | shasum -a 256 -c -
+
+      - name: Verify the finished DMG and contained signature
+        run: |
+          set -euo pipefail
+          DMG_PATH="out/FishBall-Client-mac-$TARGET_ARCH.dmg"
+          test -s "$DMG_PATH"
+          test -s "$DMG_PATH.blockmap"
+          hdiutil verify "$DMG_PATH"
+          MOUNT_POINT="$RUNNER_TEMP/fishball-94-$TARGET_ARCH"
+          mkdir "$MOUNT_POINT"
+          hdiutil attach "$DMG_PATH" -readonly -nobrowse -mountpoint "$MOUNT_POINT"
+          trap 'hdiutil detach "$MOUNT_POINT"' EXIT
+          codesign --verify --deep --strict "$MOUNT_POINT/FishBall Client.app"
+          codesign --verify -R='identifier "top.mcfishball.client"' "$MOUNT_POINT/FishBall Client.app"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$MOUNT_POINT/FishBall Client.app/Contents/Info.plist")" = 1.0.94
+          node <<'NODE'
+          const fs = require('node:fs');
+          const crypto = require('node:crypto');
+          const fileName = `FishBall-Client-mac-${process.env.TARGET_ARCH}.dmg`;
+          const bytes = fs.readFileSync(`out/${fileName}`);
+          const proof = {
+            version: '1.0.94', architecture: process.env.TARGET_ARCH, fileName,
+            size: bytes.length,
+            sha256: crypto.createHash('sha256').update(bytes).digest('hex'),
+            sha512: crypto.createHash('sha512').update(bytes).digest('base64'),
+            sourceZipSha256: process.env.ZIP_SHA256,
+            validation: 'DMG verified; contained app deep strict signature and stable identifier requirement verified'
+          };
+          fs.writeFileSync(`out/manifest-mac-${process.env.TARGET_ARCH}.json`, JSON.stringify(proof, null, 2) + '\n');
+          console.log(JSON.stringify(proof, null, 2));
+          NODE
+
+      - name: Save verified DMG artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: fishball-macos-94-dmg-${{ matrix.arch }}
+          path: |
+            out/*.dmg
+            out/*.dmg.blockmap
+            out/manifest-mac-*.json
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload DMGs to the existing draft without publishing
+        run: |
+          set -euo pipefail
+          test "$(gh api "repos/$GH_REPO/releases/tags/$RELEASE_TAG" --jq .draft)" = true
+          gh release upload "$RELEASE_TAG" --repo "$GH_REPO" --clobber \
+            "out/FishBall-Client-mac-$TARGET_ARCH.dmg" \
+            "out/FishBall-Client-mac-$TARGET_ARCH.dmg.blockmap"
